@@ -2,6 +2,9 @@
 *.db
 *.db-journal
 
+# Virtual Environment
+venv/
+
 # Python artifacts
 __pycache__/
 *.pyc
