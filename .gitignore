@@ -1,0 +1,20 @@
+# SQLite database
+*.db
+*.db-journal
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# VS Code settings
+.vscode/
+
+# Node.js dependencies
+node_modules/
+
+# Environment variables
+.env
+
+# OS-generated files
+.DS_Store
+Thumbs.db
