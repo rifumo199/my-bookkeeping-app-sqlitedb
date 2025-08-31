@@ -67,6 +67,15 @@ class BookkeepingApp:
         # --- Action Button ---
         ttk.Button(input_frame, text="Add Customer", command=self.add_customer).grid(row=3, column=0, columnspan=2, pady=10)
 
+        # --- Search Frame ---
+        search_frame = ttk.LabelFrame(main_frame, text="Search Customers", padding="10")
+        search_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(search_frame, text="Search by Name:").pack(side=tk.LEFT, padx=(0, 5))
+        self.search_entry = ttk.Entry(search_frame)
+        self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.search_entry.bind("<KeyRelease>", self.search_customers)
+
         # --- Customer List Frame (using Treeview) ---
         tree_frame = ttk.LabelFrame(main_frame, text="Customers", padding="10")
         tree_frame.pack(fill=tk.BOTH, expand=True)
@@ -91,11 +100,14 @@ class BookkeepingApp:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+        # Bind double-click event to the treeview for editing
+        self.tree.bind("<Double-1>", self.open_edit_window)
+
         # --- Delete Button ---
         delete_button = ttk.Button(main_frame, text="Delete Selected Customer", command=self.delete_customer)
         delete_button.pack(pady=5)
 
-    def load_customers(self):
+    def load_customers(self, search_term=""):
         """Clear the treeview and load all customers from the database."""
         self.root.config(cursor="watch") # Set a busy cursor
         self.root.update_idletasks() # Ensure cursor updates immediately
@@ -104,13 +116,24 @@ class BookkeepingApp:
             for item in self.tree.get_children():
                 self.tree.delete(item)
 
-            # Fetch and display new data
-            self.cursor.execute("SELECT id, name, email, contact FROM customers ORDER BY id")
+            # Fetch and display new data, with optional search
+            if search_term:
+                query = "SELECT id, name, email, contact FROM customers WHERE name LIKE ? ORDER BY id"
+                self.cursor.execute(query, ('%' + search_term + '%',))
+            else:
+                query = "SELECT id, name, email, contact FROM customers ORDER BY id"
+                self.cursor.execute(query)
+
             customers = self.cursor.fetchall()
             for customer in customers:
                 self.tree.insert('', tk.END, values=customer)
         finally:
             self.root.config(cursor="") # Reset to the default cursor
+
+    def search_customers(self, event=None):
+        """Filter the customer list based on the search entry."""
+        search_term = self.search_entry.get().strip()
+        self.load_customers(search_term)
 
     def add_customer(self):
         """Handle adding a new customer to the database."""
@@ -154,6 +177,58 @@ class BookkeepingApp:
                 self.load_customers() # Refresh the list
             except sqlite3.Error as e:
                 messagebox.showerror("Database Error", f"Failed to delete customer: {e}")
+
+    def open_edit_window(self, event):
+        """Open a new window to edit the selected customer's details."""
+        selected_item = self.tree.focus()
+        if not selected_item:
+            return # No item selected
+
+        customer_data = self.tree.item(selected_item, 'values')
+        customer_id, old_name, old_email, old_contact = customer_data
+
+        edit_win = tk.Toplevel(self.root)
+        edit_win.title("Edit Customer")
+
+        edit_frame = ttk.Frame(edit_win, padding="10")
+        edit_frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(edit_frame, text="Name:").grid(row=0, column=0, sticky="w", pady=2)
+        name_entry = ttk.Entry(edit_frame, width=40)
+        name_entry.grid(row=0, column=1, pady=2)
+        name_entry.insert(0, old_name)
+
+        ttk.Label(edit_frame, text="Email:").grid(row=1, column=0, sticky="w", pady=2)
+        email_entry = ttk.Entry(edit_frame, width=40)
+        email_entry.grid(row=1, column=1, pady=2)
+        email_entry.insert(0, old_email)
+
+        ttk.Label(edit_frame, text="Contact:").grid(row=2, column=0, sticky="w", pady=2)
+        contact_entry = ttk.Entry(edit_frame, width=40)
+        contact_entry.grid(row=2, column=1, pady=2)
+        contact_entry.insert(0, old_contact)
+
+        save_button = ttk.Button(edit_frame, text="Save Changes",
+                                 command=lambda: self.save_customer_changes(
+                                     customer_id, name_entry, email_entry, contact_entry, edit_win
+                                 ))
+        save_button.grid(row=3, column=0, columnspan=2, pady=10)
+
+    def save_customer_changes(self, customer_id, name_entry, email_entry, contact_entry, edit_win):
+        """Save the updated customer details to the database."""
+        new_name = name_entry.get().strip()
+        new_email = email_entry.get().strip()
+        new_contact = contact_entry.get().strip()
+
+        if not new_name:
+            messagebox.showerror("Error", "Name is a required field!", parent=edit_win)
+            return
+
+        self.cursor.execute("UPDATE customers SET name = ?, email = ?, contact = ? WHERE id = ?",
+                            (new_name, new_email, new_contact, customer_id))
+        self.conn.commit()
+        edit_win.destroy()
+        self.load_customers()
 
     def on_closing(self):
         """Handles the window closing event to safely close the DB connection."""
