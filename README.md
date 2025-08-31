@@ -24,6 +24,6 @@ A simple desktop application for managing customer information, built with Pytho
 
 3.  **Install dependencies and run**:
     ```bash
-    pip install sv-ttk
+    pip install sv-ttk Pillow
     python3 bookkeeping.py
     ```

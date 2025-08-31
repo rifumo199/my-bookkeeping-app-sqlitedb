@@ -1,5 +1,7 @@
 import sqlite3
 import tkinter as tk
+import csv
+import json
 from tkinter import messagebox
 from PIL import Image, ImageTk
 
@@ -21,6 +23,12 @@ class BookkeepingApp:
             self.root.destroy()
             return
 
+        # Load window geometry
+        self._load_geometry()
+
+        # Create the menu bar
+        self._create_menu()
+
         self.create_table()
         # Create UI widgets
         self.create_widgets()
@@ -30,6 +38,9 @@ class BookkeepingApp:
 
         # Ensure DB connection is closed when window is closed
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # For the Undo feature
+        self._last_deleted_customer = None
 
     def create_table(self):
         """Create the customers table if it doesn't already exist."""
@@ -42,6 +53,28 @@ class BookkeepingApp:
             )
         ''')
         self.conn.commit()
+
+    def _create_menu(self):
+        """Creates the main application menu bar."""
+        menu_bar = tk.Menu(self.root)
+        self.root.config(menu=menu_bar)
+
+        # File Menu
+        file_menu = tk.Menu(menu_bar, tearoff=0)
+        self.undo_menu_item_index = file_menu.index("end") # Placeholder for undo
+        file_menu.add_command(label="Preferences...", command=self.open_preferences_window)
+        file_menu.add_command(label="Export to CSV...", command=self.export_to_csv)
+        menu_bar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Exit", command=self.on_closing)
+
+        # Help Menu
+        help_menu = tk.Menu(menu_bar, tearoff=0)
+        menu_bar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="About", command=self.show_about_dialog)
+
+    def show_about_dialog(self):
+        """Displays the about dialog box."""
+        messagebox.showinfo("About Bookkeeping App", "Bookkeeping App v1.0\n\nCreated by Oliver.")
 
     def create_widgets(self):
         """Create and layout the UI elements."""
@@ -114,6 +147,9 @@ class BookkeepingApp:
         # Bind double-click event to the treeview for editing
         self.tree.bind("<Double-1>", self.open_edit_window)
 
+        # Bind right-click event for the context menu
+        self.tree.bind("<Button-3>", self.show_context_menu)
+
         # Keep track of the last sorted column
         self._last_sort_column = None
         self._last_sort_reverse = False
@@ -183,6 +219,32 @@ class BookkeepingApp:
         self._last_sort_column = col
         self._last_sort_reverse = reverse
 
+    def export_to_csv(self):
+        """Export the current customer list to a CSV file."""
+        from tkinter import filedialog
+        
+        # Open a "save as" dialog
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Export Customers to CSV"
+        )
+
+        if not file_path:
+            return # User cancelled the dialog
+
+        try:
+            self.cursor.execute("SELECT id, name, email, contact FROM customers ORDER BY name")
+            customers = self.cursor.fetchall()
+            
+            with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['ID', 'Name', 'Email', 'Contact']) # Write header
+                writer.writerows(customers) # Write data
+            self.show_status(f"Successfully exported {len(customers)} customers to {file_path}")
+        except (IOError, sqlite3.Error) as e:
+            messagebox.showerror("Export Error", f"Failed to export data: {e}")
+
     def show_status(self, message, duration=4000):
         """Display a message in the status bar for a set duration."""
         self.status_bar.config(text=message)
@@ -228,13 +290,27 @@ class BookkeepingApp:
 
         # Ask for confirmation
         if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete {customer_name}?"):
+            # Store the customer data before deleting for the undo feature
+            self._last_deleted_customer = {
+                'id': customer_id,
+                'name': customer_name,
+                'email': customer_data[2],
+                'contact': customer_data[3]
+            }
+
             try:
                 self.cursor.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
                 self.conn.commit()
                 self.show_status(f"Customer '{customer_name}' deleted successfully.")
                 self.load_customers() # Refresh the list
+                self._add_undo_option()
             except sqlite3.Error as e:
                 messagebox.showerror("Database Error", f"Failed to delete customer: {e}")
+
+    def _add_undo_option(self):
+        """Adds an 'Undo Delete' option to the File menu."""
+        file_menu = self.root.nametowidget(self.root.cget("menu")).winfo_children()[0]
+        file_menu.insert_command(self.undo_menu_item_index, label="Undo Delete", command=self.undo_delete)
 
     def open_edit_window(self, event=None):
         """Open a new window to edit the selected customer's details."""
@@ -245,10 +321,70 @@ class BookkeepingApp:
         customer_data = self.tree.item(selected_item, 'values')
         EditWindow(self, customer_data)
 
+    def undo_delete(self):
+        """Re-inserts the last deleted customer into the database."""
+        if self._last_deleted_customer:
+            customer = self._last_deleted_customer
+            try:
+                self.cursor.execute("INSERT INTO customers (id, name, email, contact) VALUES (?, ?, ?, ?)",
+                                    (customer['id'], customer['name'], customer['email'], customer['contact']))
+                self.conn.commit()
+                self.show_status(f"Restored customer '{customer['name']}'.")
+                self.load_customers()
+                self._last_deleted_customer = None
+                # Remove the 'Undo' option from the menu
+                file_menu = self.root.nametowidget(self.root.cget("menu")).winfo_children()[0]
+                file_menu.delete("Undo Delete")
+            except sqlite3.Error as e:
+                messagebox.showerror("Undo Error", f"Failed to restore customer: {e}")
+
+    def show_context_menu(self, event):
+        """Display a right-click context menu on the treeview."""
+        # Identify the item that was right-clicked
+        item_id = self.tree.identify_row(event.y)
+
+        if item_id:
+            # Select the right-clicked item
+            self.tree.selection_set(item_id)
+            self.tree.focus(item_id)
+
+            # Create a context menu
+            context_menu = tk.Menu(self.root, tearoff=0)
+            context_menu.add_command(label="Edit Customer", command=self.open_edit_window)
+            context_menu.add_command(label="Delete Customer", command=self.delete_customer)
+            
+            # Display the menu at the cursor's position
+            context_menu.tk_popup(event.x_root, event.y_root)
+
+    def open_preferences_window(self):
+        """Opens the preferences window."""
+        PreferencesWindow(self)
+
     def on_closing(self):
-        """Handles the window closing event to safely close the DB connection."""
+        """Handles the window closing event to save geometry and close the DB connection."""
+        self._save_geometry()
         self.conn.close()
         self.root.destroy()
+
+    def _save_geometry(self):
+        """Saves the current window size and position to a config file."""
+        try:
+            with open("config.json", "w") as f:
+                config = {"geometry": self.root.geometry(), "theme": sv_ttk.get_theme()}
+                json.dump(config, f, indent=4)
+        except IOError as e:
+            print(f"Warning: Could not save window geometry: {e}")
+
+    def _load_geometry(self):
+        """Loads the window size and position from a config file."""
+        try:
+            with open("config.json", "r") as f: 
+                config = json.load(f)
+                self.root.geometry(config["geometry"])
+                sv_ttk.set_theme(config.get("theme", "dark"))
+        except (IOError, json.JSONDecodeError, KeyError):
+            # File doesn't exist, is corrupt, or key is missing. Use default size.
+            sv_ttk.set_theme("dark")
 
 class EditWindow(tk.Toplevel):
     """A Toplevel window for editing a customer's details."""
@@ -307,16 +443,44 @@ class EditWindow(tk.Toplevel):
         except sqlite3.Error as e:
             messagebox.showerror("Database Error", f"Failed to update customer: {e}", parent=self)
 
+class PreferencesWindow(tk.Toplevel):
+    """A Toplevel window for application preferences."""
+    def __init__(self, parent_app):
+        super().__init__(parent_app.root)
+        self.parent_app = parent_app
+
+        self.title("Preferences")
+        self.transient(parent_app.root)
+        self.grab_set()
+
+        frame = ttk.Frame(self, padding="20")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="Theme:").pack(pady=(0, 5))
+
+        ttk.Button(frame, text="Set Light Theme", command=lambda: self.set_theme("light")).pack(fill=tk.X, pady=2)
+        ttk.Button(frame, text="Set Dark Theme", command=lambda: self.set_theme("dark")).pack(fill=tk.X, pady=2)
+
+    def set_theme(self, theme_name):
+        sv_ttk.set_theme(theme_name)
+        self.parent_app.show_status(f"Theme changed to {theme_name}. Restart app for full effect.")
+        self.destroy()
+
 if __name__ == "__main__":
     root = tk.Tk()
+    # Hide the root window initially to prevent flashing
+    root.withdraw()
+
     app = BookkeepingApp(root)
 
-    # Set the application icon
-    icon_image = Image.open("icon.png") # Make sure you have an 'icon.png' file
-    photo_image = ImageTk.PhotoImage(icon_image)
-    root.iconphoto(False, photo_image)
+    # Set the application icon (ensure icon.png is in the project directory)
+    try:
+        icon_image = Image.open("icon.png")
+        photo_image = ImageTk.PhotoImage(icon_image)
+        root.iconphoto(False, photo_image)
+    except FileNotFoundError:
+        print("Warning: icon.png not found. Skipping icon setup.")
 
-    # Set the theme
-    sv_ttk.set_theme("dark")
-
+    # Make the window visible now that it's fully configured
+    root.deiconify()
     root.mainloop()
