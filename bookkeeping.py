@@ -2,6 +2,7 @@ import sqlite3
 import tkinter as tk
 import csv
 import json
+from datetime import date, timedelta
 from tkinter import messagebox
 from PIL import Image, ImageTk
 
@@ -35,6 +36,10 @@ class BookkeepingApp:
 
         # Load initial data into the view
         self.load_customers()
+        self.load_invoices()
+
+        # Bind tab change event
+        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_selected)
 
         # Ensure DB connection is closed when window is closed
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -43,7 +48,7 @@ class BookkeepingApp:
         self._last_deleted_customer = None
 
     def create_table(self):
-        """Create the customers table if it doesn't already exist."""
+        """Create the tables if they don't already exist."""
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS customers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,6 +57,36 @@ class BookkeepingApp:
                 contact TEXT
             )
         ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS invoices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_id INTEGER NOT NULL,
+                invoice_date TEXT NOT NULL,
+                due_date TEXT NOT NULL,
+                total_amount REAL NOT NULL,
+                tax_amount REAL NOT NULL,
+                status TEXT NOT NULL,
+                FOREIGN KEY (customer_id) REFERENCES customers (id)
+            )
+        ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS invoice_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_id INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                unit_price REAL NOT NULL,
+                FOREIGN KEY (invoice_id) REFERENCES invoices (id)
+            )
+        ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        ''')
+        # Add default tax rate if not present
+        self.cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('tax_rate', '0.2')")
         self.conn.commit()
 
     def _create_menu(self):
@@ -82,10 +117,25 @@ class BookkeepingApp:
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        self._create_input_frame(main_frame)
-        self._create_search_frame(main_frame)
-        self._create_treeview_frame(main_frame)
-        self._create_action_buttons(main_frame)
+        # --- Create a Notebook (tabbed interface) ---
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        # --- Create Customer Tab ---
+        customer_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(customer_tab, text="Customers")
+
+        self._create_input_frame(customer_tab)
+        self._create_search_frame(customer_tab)
+        self._create_treeview_frame(customer_tab)
+        self._create_action_buttons(customer_tab)
+
+        # --- Create Invoices Tab ---
+        invoices_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(invoices_tab, text="Invoices")
+        self._create_invoice_widgets(invoices_tab)
+
+
         self._create_status_bar(main_frame)
 
     def _create_input_frame(self, parent_frame):
@@ -164,6 +214,98 @@ class BookkeepingApp:
         self.status_bar = ttk.Label(parent_frame, text="Ready", anchor=tk.W)
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
         self.status_timer = None
+
+    def _create_invoice_widgets(self, parent_frame):
+        """Create and layout the UI elements for the invoices tab."""
+        # --- Invoice List Frame (using Treeview) ---
+        invoice_tree_frame = ttk.LabelFrame(parent_frame, text="Invoices", padding="10")
+        invoice_tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        columns = ('id', 'customer', 'invoice_date', 'due_date', 'total_amount', 'status')
+        self.invoice_tree = ttk.Treeview(invoice_tree_frame, columns=columns, show='headings')
+
+        # Define headings and column properties
+        self.invoice_tree.heading('id', text='ID')
+        self.invoice_tree.column('id', width=40, anchor=tk.CENTER)
+        self.invoice_tree.heading('customer', text='Customer')
+        self.invoice_tree.column('customer', width=150)
+        self.invoice_tree.heading('invoice_date', text='Invoice Date')
+        self.invoice_tree.column('invoice_date', width=100)
+        self.invoice_tree.heading('due_date', text='Due Date')
+        self.invoice_tree.column('due_date', width=100)
+        self.invoice_tree.heading('total_amount', text='Total')
+        self.invoice_tree.column('total_amount', width=80, anchor=tk.E)
+        self.invoice_tree.heading('status', text='Status')
+        self.invoice_tree.column('status', width=80, anchor=tk.CENTER)
+
+
+        # Add a scrollbar
+        scrollbar = ttk.Scrollbar(invoice_tree_frame, orient=tk.VERTICAL, command=self.invoice_tree.yview)
+        self.invoice_tree.configure(yscroll=scrollbar.set)
+
+        self.invoice_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # --- Action Buttons ---
+        invoice_actions_frame = ttk.Frame(parent_frame, padding="10")
+        invoice_actions_frame.pack(fill=tk.X)
+        
+        ttk.Button(invoice_actions_frame, text="Create New Invoice", command=self.create_invoice).pack(side=tk.LEFT, padx=5)
+        ttk.Button(invoice_actions_frame, text="View/Edit Invoice", command=self.edit_invoice).pack(side=tk.LEFT, padx=5)
+        ttk.Button(invoice_actions_frame, text="Delete Invoice", command=self.delete_invoice).pack(side=tk.LEFT, padx=5)
+
+    def load_invoices(self):
+        """Clear the treeview and load all invoices from the database."""
+        self.root.config(cursor="watch") # Set a busy cursor
+        self.root.update_idletasks() # Ensure cursor updates immediately
+        try:
+            # Clear existing items to prevent duplication
+            for item in self.invoice_tree.get_children():
+                self.invoice_tree.delete(item)
+
+            # Fetch and display new data
+            query = """
+                SELECT i.id, c.name, i.invoice_date, i.due_date, i.total_amount, i.status
+                FROM invoices i
+                JOIN customers c ON i.customer_id = c.id
+                ORDER BY i.id
+            """
+            self.cursor.execute(query)
+
+            invoices = self.cursor.fetchall()
+            for invoice in invoices:
+                self.invoice_tree.insert('', tk.END, values=invoice)
+        finally:
+            self.root.config(cursor="") # Reset to the default cursor
+
+    def create_invoice(self):
+        InvoiceWindow(self)
+
+    def edit_invoice(self):
+        selected_item = self.invoice_tree.focus()
+        if not selected_item:
+            messagebox.showerror("Error", "Please select an invoice to edit.")
+            return
+        invoice_id = self.invoice_tree.item(selected_item, 'values')[0]
+        InvoiceWindow(self, invoice_id)
+
+    def delete_invoice(self):
+        selected_item = self.invoice_tree.focus()
+        if not selected_item:
+            messagebox.showerror("Error", "Please select an invoice to delete.")
+            return
+        
+        invoice_id = self.invoice_tree.item(selected_item, 'values')[0]
+
+        if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete invoice ID: {invoice_id}?"):
+            try:
+                self.cursor.execute("DELETE FROM invoice_items WHERE invoice_id = ?", (invoice_id,))
+                self.cursor.execute("DELETE FROM invoices WHERE id = ?", (invoice_id,))
+                self.conn.commit()
+                self.show_status(f"Invoice ID: {invoice_id} deleted successfully.")
+                self.load_invoices()
+            except sqlite3.Error as e:
+                messagebox.showerror("Database Error", f"Failed to delete invoice: {e}")
 
     def load_customers(self, search_term=""):
         """Clear the treeview and load all customers from the database."""
@@ -356,6 +498,13 @@ class BookkeepingApp:
             # Display the menu at the cursor's position
             context_menu.tk_popup(event.x_root, event.y_root)
 
+    def on_tab_selected(self, event):
+        selected_tab = self.notebook.index(self.notebook.select())
+        if selected_tab == 0: # Customer tab
+            self.load_customers()
+        elif selected_tab == 1: # Invoices tab
+            self.load_invoices()
+
     def open_preferences_window(self):
         """Opens the preferences window."""
         PreferencesWindow(self)
@@ -461,9 +610,270 @@ class PreferencesWindow(tk.Toplevel):
         ttk.Button(frame, text="Set Light Theme", command=lambda: self.set_theme("light")).pack(fill=tk.X, pady=2)
         ttk.Button(frame, text="Set Dark Theme", command=lambda: self.set_theme("dark")).pack(fill=tk.X, pady=2)
 
+        ttk.Label(frame, text="Tax Rate (%):").pack(pady=(10, 5))
+        self.tax_rate_entry = ttk.Entry(frame)
+        self.tax_rate_entry.pack(fill=tk.X, pady=2)
+        self.load_tax_rate()
+
+        save_button = ttk.Button(frame, text="Save Preferences", command=self.save_preferences)
+        save_button.pack(pady=10)
+
     def set_theme(self, theme_name):
         sv_ttk.set_theme(theme_name)
         self.parent_app.show_status(f"Theme changed to {theme_name}. Restart app for full effect.")
+
+    def load_tax_rate(self):
+        self.parent_app.cursor.execute("SELECT value FROM settings WHERE key = 'tax_rate'")
+        tax_rate = float(self.parent_app.cursor.fetchone()[0]) * 100
+        self.tax_rate_entry.insert(0, f"{tax_rate:.2f}")
+
+    def save_preferences(self):
+        try:
+            tax_rate = float(self.tax_rate_entry.get()) / 100
+            self.parent_app.cursor.execute("UPDATE settings SET value = ? WHERE key = ?", (str(tax_rate), 'tax_rate'))
+            self.parent_app.conn.commit()
+            self.parent_app.show_status("Preferences saved successfully.")
+            self.destroy()
+        except ValueError:
+            messagebox.showerror("Error", "Invalid tax rate. Please enter a number.", parent=self)
+        except sqlite3.Error as e:
+            messagebox.showerror("Database Error", f"Failed to save preferences: {e}", parent=self)
+
+class InvoiceWindow(tk.Toplevel):
+    """A Toplevel window for creating and editing an invoice."""
+    def __init__(self, parent_app, invoice_id=None):
+        super().__init__(parent_app.root)
+        self.parent_app = parent_app
+        self.invoice_id = invoice_id
+
+        self.title("Create New Invoice" if not invoice_id else f"Edit Invoice #{invoice_id}")
+        self.transient(parent_app.root)
+        self.grab_set()
+
+        # --- Main Frame ---
+        main_frame = ttk.Frame(self, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # --- Customer and Dates Frame ---
+        info_frame = ttk.LabelFrame(main_frame, text="Invoice Details", padding="10")
+        info_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # Customer
+        ttk.Label(info_frame, text="Customer:").grid(row=0, column=0, sticky="w", pady=2)
+        self.customer_var = tk.StringVar()
+        self.customer_menu = ttk.Combobox(info_frame, textvariable=self.customer_var, state="readonly")
+        self.customer_menu.grid(row=0, column=1, sticky="we", pady=2)
+        self.customers = self.load_customer_list()
+
+        # Invoice Date
+        ttk.Label(info_frame, text="Invoice Date:").grid(row=1, column=0, sticky="w", pady=2)
+        self.invoice_date_entry = ttk.Entry(info_frame)
+        self.invoice_date_entry.grid(row=1, column=1, sticky="we", pady=2)
+        self.invoice_date_entry.insert(0, date.today().strftime('%Y-%m-%d'))
+
+        # Due Date
+        ttk.Label(info_frame, text="Due Date:").grid(row=2, column=0, sticky="w", pady=2)
+        self.due_date_entry = ttk.Entry(info_frame)
+        self.due_date_entry.grid(row=2, column=1, sticky="we", pady=2)
+        self.due_date_entry.insert(0, (date.today() + timedelta(days=30)).strftime('%Y-%m-%d'))
+
+        # --- Invoice Items Frame ---
+        items_frame = ttk.LabelFrame(main_frame, text="Invoice Items", padding="10")
+        items_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        columns = ('description', 'quantity', 'unit_price', 'total')
+        self.items_tree = ttk.Treeview(items_frame, columns=columns, show='headings')
+        self.items_tree.heading('description', text='Description')
+        self.items_tree.heading('quantity', text='Quantity')
+        self.items_tree.heading('unit_price', text='Unit Price')
+        self.items_tree.heading('total', text='Total')
+        self.items_tree.pack(fill=tk.BOTH, expand=True)
+
+        # --- Totals Frame ---
+        totals_frame = ttk.Frame(main_frame, padding="10")
+        totals_frame.pack(fill=tk.X)
+
+        ttk.Label(totals_frame, text="Subtotal:").grid(row=0, column=0, sticky="e")
+        self.subtotal_label = ttk.Label(totals_frame, text="0.00")
+        self.subtotal_label.grid(row=0, column=1, sticky="w")
+
+        ttk.Label(totals_frame, text="Tax:").grid(row=1, column=0, sticky="e")
+        self.tax_label = ttk.Label(totals_frame, text="0.00")
+        self.tax_label.grid(row=1, column=1, sticky="w")
+
+        ttk.Label(totals_frame, text="Total:").grid(row=2, column=0, sticky="e")
+        self.total_label = ttk.Label(totals_frame, text="0.00")
+        self.total_label.grid(row=2, column=1, sticky="w")
+
+        # --- Action Buttons ---
+        action_frame = ttk.Frame(main_frame, padding="10")
+        action_frame.pack(fill=tk.X)
+        ttk.Button(action_frame, text="Add Item", command=self.add_item).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="Remove Item", command=self.remove_item).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="Save Invoice", command=self.save_invoice).pack(side=tk.RIGHT, padx=5)
+
+        if self.invoice_id:
+            self.load_invoice_data()
+
+    def load_customer_list(self):
+        self.parent_app.cursor.execute("SELECT id, name FROM customers ORDER BY name")
+        customers = self.parent_app.cursor.fetchall()
+        self.customer_menu['values'] = [f"{name} (ID: {cid})" for cid, name in customers]
+        return {cid: name for cid, name in customers}
+
+    def load_invoice_data(self):
+        self.parent_app.cursor.execute("SELECT customer_id, invoice_date, due_date FROM invoices WHERE id = ?", (self.invoice_id,))
+        customer_id, invoice_date, due_date = self.parent_app.cursor.fetchone()
+
+        self.customer_var.set(f"{self.customers[customer_id]} (ID: {customer_id})")
+        self.invoice_date_entry.delete(0, tk.END)
+        self.invoice_date_entry.insert(0, invoice_date)
+        self.due_date_entry.delete(0, tk.END)
+        self.due_date_entry.insert(0, due_date)
+
+        self.parent_app.cursor.execute("SELECT description, quantity, unit_price FROM invoice_items WHERE invoice_id = ?", (self.invoice_id,))
+        for item in self.parent_app.cursor.fetchall():
+            description, quantity, unit_price = item
+            total = quantity * unit_price
+            self.items_tree.insert('', tk.END, values=(description, quantity, unit_price, f"{total:.2f}"))
+        self.update_totals()
+
+    def add_item(self):
+        AddItemWindow(self)
+
+    def remove_item(self):
+        selected_item = self.items_tree.focus()
+        if not selected_item:
+            messagebox.showerror("Error", "Please select an item to remove.", parent=self)
+            return
+        self.items_tree.delete(selected_item)
+        self.update_totals()
+
+    def update_totals(self):
+        subtotal = 0
+        for item_id in self.items_tree.get_children():
+            item = self.items_tree.item(item_id, 'values')
+            subtotal += float(item[3])
+
+        self.parent_app.cursor.execute("SELECT value FROM settings WHERE key = 'tax_rate'")
+        tax_rate = float(self.parent_app.cursor.fetchone()[0])
+        
+        tax = subtotal * tax_rate
+        total = subtotal + tax
+
+        self.subtotal_label.config(text=f"{subtotal:.2f}")
+        self.tax_label.config(text=f"{tax:.2f}")
+        self.total_label.config(text=f"{total:.2f}")
+
+    def save_invoice(self):
+        customer_str = self.customer_var.get()
+        if not customer_str:
+            messagebox.showerror("Error", "Please select a customer.", parent=self)
+            return
+        
+        customer_id = int(customer_str.split("(ID: ")[1][:-1])
+        invoice_date = self.invoice_date_entry.get()
+        due_date = self.due_date_entry.get()
+        
+        items = []
+        for item_id in self.items_tree.get_children():
+            items.append(self.items_tree.item(item_id, 'values'))
+
+        if not items:
+            messagebox.showerror("Error", "Please add at least one item to the invoice.", parent=self)
+            return
+
+        subtotal = sum(float(item[3]) for item in items)
+        
+        self.parent_app.cursor.execute("SELECT value FROM settings WHERE key = 'tax_rate'")
+        tax_rate = float(self.parent_app.cursor.fetchone()[0])
+        tax_amount = subtotal * tax_rate
+        total_amount = subtotal + tax_amount
+
+        try:
+            if self.invoice_id:
+                # Update existing invoice
+                self.parent_app.cursor.execute("""
+                    UPDATE invoices 
+                    SET customer_id = ?, invoice_date = ?, due_date = ?, total_amount = ?, tax_amount = ?, status = ?
+                    WHERE id = ?
+                """, (customer_id, invoice_date, due_date, total_amount, tax_amount, "Draft", self.invoice_id))
+                self.parent_app.cursor.execute("DELETE FROM invoice_items WHERE invoice_id = ?", (self.invoice_id,))
+                invoice_id = self.invoice_id
+            else:
+                # Insert new invoice
+                self.parent_app.cursor.execute("""
+                    INSERT INTO invoices (customer_id, invoice_date, due_date, total_amount, tax_amount, status)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (customer_id, invoice_date, due_date, total_amount, tax_amount, "Draft"))
+                invoice_id = self.parent_app.cursor.lastrowid
+
+            # Insert invoice items
+            for item in items:
+                description, quantity, unit_price, _ = item
+                self.parent_app.cursor.execute("""
+                    INSERT INTO invoice_items (invoice_id, description, quantity, unit_price)
+                    VALUES (?, ?, ?, ?)
+                """, (invoice_id, description, quantity, unit_price))
+
+            self.parent_app.conn.commit()
+            self.parent_app.load_invoices()
+            self.parent_app.show_status("Invoice saved successfully.")
+            self.destroy()
+        except sqlite3.Error as e:
+            messagebox.showerror("Database Error", f"Failed to save invoice: {e}", parent=self)
+
+class AddItemWindow(tk.Toplevel):
+    """A Toplevel window for adding a new item to an invoice."""
+    def __init__(self, parent_window):
+        super().__init__(parent_window)
+        self.parent_window = parent_window
+
+        self.title("Add Invoice Item")
+        self.transient(parent_window)
+        self.grab_set()
+
+        item_frame = ttk.Frame(self, padding="10")
+        item_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Description
+        ttk.Label(item_frame, text="Description:").grid(row=0, column=0, sticky="w", pady=2)
+        self.description_entry = ttk.Entry(item_frame, width=40)
+        self.description_entry.grid(row=0, column=1, pady=2)
+
+        # Quantity
+        ttk.Label(item_frame, text="Quantity:").grid(row=1, column=0, sticky="w", pady=2)
+        self.quantity_entry = ttk.Entry(item_frame, width=40)
+        self.quantity_entry.grid(row=1, column=1, pady=2)
+
+        # Unit Price
+        ttk.Label(item_frame, text="Unit Price:").grid(row=2, column=0, sticky="w", pady=2)
+        self.unit_price_entry = ttk.Entry(item_frame, width=40)
+        self.unit_price_entry.grid(row=2, column=1, pady=2)
+
+        # Add Button
+        add_button = ttk.Button(item_frame, text="Add Item", command=self.add_item_to_invoice)
+        add_button.grid(row=3, column=0, columnspan=2, pady=10)
+
+    def add_item_to_invoice(self):
+        description = self.description_entry.get().strip()
+        quantity_str = self.quantity_entry.get().strip()
+        unit_price_str = self.unit_price_entry.get().strip()
+
+        if not all([description, quantity_str, unit_price_str]):
+            messagebox.showerror("Error", "All fields are required!", parent=self)
+            return
+
+        try:
+            quantity = float(quantity_str)
+            unit_price = float(unit_price_str)
+        except ValueError:
+            messagebox.showerror("Error", "Quantity and Unit Price must be numbers!", parent=self)
+            return
+
+        total = quantity * unit_price
+        self.parent_window.items_tree.insert('', tk.END, values=(description, quantity, unit_price, f"{total:.2f}"))
+        self.parent_window.update_totals()
         self.destroy()
 
 if __name__ == "__main__":
